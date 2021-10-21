@@ -1,15 +1,24 @@
-use std::io::{stdin, stdout, Write};
-use std::sync::mpsc::channel;
-use std::sync::{Arc, RwLock};
-use std::{io::Stdout, thread, time};
+use std::io::stdin;
 use termion::{
     clear, color, cursor, cursor::Goto, event, input::TermRead, raw::IntoRawMode, raw::RawTerminal,
     style, terminal_size,
 };
+use tokio;
+use tokio::io::AsyncWriteExt;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
-fn main() {
-    let mut stdout = stdout().into_raw_mode().unwrap();
+#[tokio::main]
+async fn main() {
+    //channels
+    let (stdout, mut stdout_rx) = unbounded_channel();
+    let stdout_iterator = stdout.clone();
+    let (input, mut input_rx) = unbounded_channel();
+    let events = stdin().events();
+    let mut std = std::io::stdout().into_raw_mode().unwrap();
 
+    //tasks
+
+    //setup
     let size = terminal_size().unwrap();
     let border_buffer = 100;
     let grid_width = size.0 / 2;
@@ -24,78 +33,78 @@ fn main() {
     let center_y = grid[0].len() / 2;
 
     grid[center_x][center_y] = 1;
-    grid[center_x + 1][center_y] = 1;
     grid[center_x - 1][center_y] = 1;
+    grid[center_x + 1][center_y] = 1;
+    grid[center_x][center_y - 1] = 1;
     grid[center_x + 1][center_y + 1] = 1;
-    grid[center_x][center_y + 2] = 1;
-
-    let (te, re) = channel();
-    let running = Arc::new(RwLock::new(true));
-    let events = stdin().events();
-    let running_ = running.clone();
-    let event_loop = thread::spawn(move || {
+    stdout
+        .clone()
+        .send(format!("{}{}{}", clear::All, cursor::Hide, Goto(1, 1)))
+        .unwrap();
+    let iterator = tokio::spawn(async move {
+        loop {
+            while let Ok(event) = input_rx.try_recv() {
+                stdout_iterator.send("1".to_string()).unwrap();
+            }
+            display(
+                stdout_iterator.clone(),
+                &grid,
+                border_buffer,
+                grid_width,
+                grid_height,
+                step,
+            );
+            let prev = grid.clone();
+            for x in 0..grid.len().into() {
+                for y in 0..grid[x].len() {
+                    let live_neighbors = count_live_neighbors(&prev, x, y);
+                    //rules of conway's game of life
+                    if prev[x][y] == 1 {
+                        if live_neighbors < 2 || live_neighbors > 3 {
+                            grid[x][y] = 0;
+                        }
+                    } else {
+                        if live_neighbors == 3 {
+                            grid[x][y] = 1;
+                        }
+                    }
+                }
+            }
+            step += 1;
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        }
+    });
+    let output_pump = tokio::spawn(async move {
+        // let mut stdout = std::io::stdout().into_raw_mode().unwrap();
+        let mut stdout = tokio::io::stdout();
+        while let Some(message) = stdout_rx.recv().await {
+            stdout.write_all(message.as_bytes()).await.unwrap();
+            stdout.flush().await.unwrap();
+        }
+    });
+    let input_task = tokio::task::spawn_blocking(move || {
         for event in events {
             let e = event.unwrap();
-            te.send(e.clone()).unwrap();
+            input.send(e.clone()).unwrap();
             match e {
-                event::Event::Key(event::Key::Ctrl('c')) => break,
+                event::Event::Key(event::Key::Ctrl('c')) => {
+                    break;
+                }
+                event::Event::Key(event::Key::Char('s')) => {}
                 _ => {}
-            }
-            if !*running_.read().unwrap() {
-                break;
             }
         }
     });
-    write!(stdout, "{}{}{}", clear::All, cursor::Hide, Goto(1, 1)).unwrap();
-    while *running.read().unwrap() {
-        for event in re.try_iter() {
-            match event {
-                event::Event::Key(event::Key::Ctrl('c')) => {
-                    *running.write().unwrap() = false;
-                }
-                _ => {}
-            }
-        }
-        //display table
-        display(
-            &mut stdout,
-            &grid,
-            border_buffer,
-            grid_width,
-            grid_height,
-            step,
-        );
-        //iteration
-        let prev = grid.clone();
-        for x in 0..grid.len().into() {
-            for y in 0..grid[x].len() {
-                let live_neighbors = count_live_neighbors(&prev, x, y);
-                //rules of conway's game of life
-                if prev[x][y] == 1 {
-                    if live_neighbors < 2 || live_neighbors > 3 {
-                        grid[x][y] = 0;
-                    }
-                } else {
-                    if live_neighbors == 3 {
-                        grid[x][y] = 1;
-                    }
-                }
-            }
-        }
-        step += 1;
-        //delay
-        thread::sleep(time::Duration::from_millis(500));
-    }
-    event_loop.join().unwrap();
-    write!(
-        stdout,
-        "{}{}{}",
-        clear::All,
-        style::Reset,
-        cursor::Goto(1, 1)
-    )
-    .unwrap();
-    return;
+    input_task.await.unwrap();
+    // stdout
+    //     .clone()
+    //     .send(format!(
+    //         "{}{}{}",
+    //         clear::All,
+    //         style::Reset,
+    //         cursor::Goto(1, 1)
+    //     ))
+    //     .unwrap();
 }
 
 fn count_live_neighbors(grid: &Vec<Vec<i32>>, row: usize, col: usize) -> i32 {
@@ -118,30 +127,31 @@ fn count_live_neighbors(grid: &Vec<Vec<i32>>, row: usize, col: usize) -> i32 {
 }
 
 fn display(
-    stdout: &mut RawTerminal<Stdout>,
+    stdout: UnboundedSender<String>,
     grid: &Vec<Vec<i32>>,
     border_buffer: u16,
     grid_width: u16,
     grid_height: u16,
     step: usize,
 ) {
-    write!(stdout, "{}{}", cursor::Goto(1, 1), color::Bg(color::Reset)).unwrap();
+    let mut strng;
+    strng = format!("{}{}", cursor::Goto(1, 1), color::Bg(color::Reset));
     //display info
-    write!(stdout, "Number of steps: {}\n\r", step).unwrap();
+    strng = format!("{}{}{}", strng, cursor::Goto(1, 1), color::Bg(color::Reset));
+    strng = format!("{}Number of steps: {}\n\r", strng, step);
     for row in &grid[border_buffer.into()..(grid_height + border_buffer).into()] {
         for cell in &row[border_buffer.into()..(grid_width + border_buffer).into()] {
-            write!(
-                stdout,
-                "{}  ",
+            strng = format!(
+                "{}{}  ",
+                strng,
                 if *cell > 0 {
                     color::Bg(color::White).to_string()
                 } else {
                     color::Bg(color::Black).to_string()
                 }
-            )
-            .unwrap();
+            );
         }
-        write!(stdout, "\n\r").unwrap();
-        stdout.flush().unwrap();
+        strng = format!("{}\n\r", strng);
     }
+    stdout.send(strng).unwrap();
 }
